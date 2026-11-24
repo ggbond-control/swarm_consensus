@@ -4,7 +4,7 @@ from swarm_consensus.simulation import Cluster
 from swarm_protocol.storage import DurableFile
 
 
-@pytest.mark.parametrize("count", [1, 2, 3, 4, 5])
+@pytest.mark.parametrize("count", [1, 2, 3, 4, 5, 6])
 def test_elect_commit_and_compact(count):
     c = Cluster(count)
     c.run()
@@ -37,7 +37,7 @@ def test_leader_loss_inherits_commit_and_rejects_old_leader():
         old.propose({"id": "illegal"}, c.now)
 
 
-@pytest.mark.parametrize("count,remaining", [(2, 1), (3, 1), (4, 2), (5, 2)])
+@pytest.mark.parametrize("count,remaining", [(2, 1), (3, 1), (4, 2), (5, 2), (6, 3)])
 def test_fixed_quorum_never_reduces(count, remaining):
     c = Cluster(count)
     c.run()

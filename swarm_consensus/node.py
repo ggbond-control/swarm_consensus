@@ -6,6 +6,7 @@ import uuid
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile
 from std_msgs.msg import String
+from swarm_protocol.audit import Audit
 from swarm_protocol.contracts import decode
 from swarm_protocol.ros import main_node, publish, runtime_path
 from swarm_protocol.storage import DurableFile, ProcessLock
@@ -28,10 +29,12 @@ class ConsensusNode(Node):
             raise ValueError("robot_id is required")
         root = runtime_path(self, "consensus")
         self.lock = ProcessLock(root / "process.lock")
+        self.audit = Audit(root, self.robot, self.get_logger())
         self.boot = uuid.uuid4().hex
         self.out = self.create_publisher(String, "/swarm/consensus/outbound", 100)
         qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.state_pub = self.create_publisher(String, "/swarm/consensus/state", qos)
+        self.entries_pub = self.create_publisher(String, "/swarm/consensus/entries", 10)
         self.read_pub = self.create_publisher(
             String, "/swarm/consensus/read_confirmed", 100
         )
@@ -49,6 +52,7 @@ class ConsensusNode(Node):
             ("/swarm/consensus/inbound", self.inbound),
             ("/swarm/consensus/propose", self.propose),
             ("/swarm/consensus/read", self.read),
+            ("/swarm/consensus/fetch", self.fetch),
         ]:
             self.create_subscription(
                 String, topic, lambda msg, cb=callback: self.safe(cb, msg), 100
@@ -69,10 +73,25 @@ class ConsensusNode(Node):
         publish(self.out, {"to": peer, "data": payload})
 
     def configure(self, value):
+        epoch = self.engine.state(time.monotonic())["round_epoch"]
         self.engine.configure(
             value["round_epoch"], value["robot_ids"], time.monotonic()
         )
-        self.identity_applied = 0
+        if epoch != value["round_epoch"]:
+            self.identity_applied = 0
+
+    def fetch(self, value):
+        state = self.engine.state(time.monotonic())
+        after = value.get("after")
+        if (
+            value.get("round_epoch") == state["round_epoch"]
+            and value.get("boot_id") == self.boot
+            and type(after) is int and 0 <= after < state["commit_index"]
+        ):
+            publish(self.entries_pub, {
+                "round_epoch": state["round_epoch"], "boot_id": self.boot,
+                "after": after, "entries": self.engine.committed_batch(after),
+            })
 
     def inbound(self, value):
         self.engine.receive(value["sender"], value["data"], time.monotonic())
@@ -86,7 +105,7 @@ class ConsensusNode(Node):
     def tick(self):
         try:
             self.engine.tick(time.monotonic())
-            for entry in self.engine.committed()[self.identity_applied :]:
+            for entry in self.engine.committed(self.identity_applied):
                 command = entry["command"]
                 if command["type"] == "ACTIVATE":
                     self.engine.bind_identities(
@@ -95,12 +114,13 @@ class ConsensusNode(Node):
                 elif command["type"] == "EXCLUDE":
                     self.engine.exclude(command["robot_id"])
                 self.identity_applied = entry["index"]
+                self.audit.record("raft_commit", entry, epoch=self.engine.disk["epoch"],
+                                  revision=command.get("revision", 0), term=entry["term"],
+                                  commit_index=entry["index"], boot_id=self.boot)
             if len(self.engine.disk["log"]) > 256:
                 self.engine.compact()
             state = self.engine.state(time.monotonic())
-            state.update(
-                robot_id=self.robot, boot_id=self.boot, entries=self.engine.committed()
-            )
+            state.update(robot_id=self.robot, boot_id=self.boot)
             publish(self.state_pub, state)
             for read in self.engine.read_ready:
                 publish(self.read_pub, read)
@@ -118,12 +138,14 @@ class ConsensusNode(Node):
                     f"term={state['term']} role={state['role']} leader={state['leader_id']} "
                     f"quorum={state['authority']} commit={state['commit_index']}"
                 )
+                self.audit.record("raft_state", state, boot_id=self.boot)
                 self.signature = signature
         except Exception as error:
             self.engine.error = f"fail-closed: {type(error).__name__}"
             self.get_logger().error(f"共识停止授权：{error}")
 
     def destroy_node(self):
+        self.audit.close()
         self.lock.close()
         return super().destroy_node()
 

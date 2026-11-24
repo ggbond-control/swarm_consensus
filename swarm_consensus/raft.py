@@ -13,6 +13,7 @@ import random
 import uuid
 
 from swarm_protocol.contracts import digest, positive_int
+from swarm_protocol.replication import entry_batch, validate_command_size
 
 
 class MemoryStore:
@@ -100,8 +101,11 @@ class Raft:
             else self.disk["log"][index - self.base - 1]
         )
 
-    def committed(self):
-        return copy.deepcopy([self.entry(i) for i in range(1, self.disk["commit"] + 1)])
+    def committed(self, after=0):
+        return copy.deepcopy([self.entry(i) for i in range(after + 1, self.disk["commit"] + 1)])
+
+    def committed_batch(self, after):
+        return entry_batch(self.entry, after + 1, self.disk["commit"])
 
     def _save(self):
         try:
@@ -173,7 +177,7 @@ class Raft:
     def authority(self, now):
         if not self.eligible() or self.role != "leader":
             return False
-        if not any(e["term"] == self.term for e in self.committed()):
+        if self.entry(self.disk["commit"])["term"] != self.term:
             return False
         peers = sum(
             now - t < self.quorum_timeout
@@ -295,6 +299,7 @@ class Raft:
                     raise ValueError("conflicting command identity")
                 self.broadcast(now)
                 return i
+        validate_command_size(command)
         self._append(command)
         self.broadcast(now)
         return self.last
@@ -302,7 +307,11 @@ class Raft:
     def read_barrier(self, request, now):
         if not self.authority(now):
             return False
+        if not isinstance(request, str) or not 0 < len(request) <= 128:
+            return False
         if request not in self.reads:
+            if len(self.reads) >= 128:
+                return False
             self.reads[request] = {
                 "started": now,
                 "acks": {self.robot},
@@ -332,30 +341,15 @@ class Raft:
     def _replicate(self, peer, now):
         rpc = uuid.uuid4().hex
         first = self.next_index.get(peer, self.last + 1)
-        self.rpcs[rpc] = {"peer": peer, "sent": now, "reads": list(self.reads)}
-        if first <= self.base:
-            self._wire(
-                peer,
-                "snapshot",
-                rpc=rpc,
-                entries=self.disk["snapshot"],
-                commit=self.disk["commit"],
-                reads=list(self.reads),
-            )
-        else:
-            entries = [
-                self.entry(i) for i in range(first, min(self.last + 1, first + 32))
-            ]
-            self._wire(
-                peer,
-                "append",
-                rpc=rpc,
-                prev=first - 1,
-                prev_term=self.entry(first - 1)["term"],
-                entries=entries,
-                commit=self.disk["commit"],
-                reads=list(self.reads),
-            )
+        entries = entry_batch(self.entry, first, self.last)
+        reads = list(self.reads)
+        last = first - 1 + len(entries)
+        self.rpcs[rpc] = {"peer": peer, "sent": now, "reads": reads, "last": last}
+        self._wire(
+            peer, "append", rpc=rpc, prev=first - 1,
+            prev_term=self.entry(first - 1)["term"], entries=entries,
+            commit=self.disk["commit"], reads=reads,
+        )
 
     def _advance(self):
         indexes = [
@@ -478,7 +472,7 @@ class Raft:
             else:
                 prev = message["prev"]
                 if (
-                    prev < self.base
+                    prev < 0
                     or prev > self.last
                     or self.entry(prev)["term"] != message["prev_term"]
                 ):
@@ -514,8 +508,10 @@ class Raft:
             if not rpc or rpc["peer"] != sender:
                 return
             if message.get("success") is True:
+                if message.get("match") != rpc["last"]:
+                    return
                 self.match[sender] = max(
-                    self.match.get(sender, 0), min(message["match"], self.last)
+                    self.match.get(sender, 0), rpc["last"]
                 )
                 self.next_index[sender] = self.match[sender] + 1
                 # An old delayed ACK cannot renew quorum authority.
@@ -531,7 +527,7 @@ class Raft:
                     self._replicate(sender, now)
             else:
                 self.next_index[sender] = max(
-                    1,
+                    self.match.get(sender, 0) + 1,
                     min(
                         self.next_index.get(sender, self.last + 1) - 1,
                         message["match"] + 1,

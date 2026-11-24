@@ -6,6 +6,6 @@
 
 进程重启后不能自行恢复旧轮执行或投票身份；须确认停止并使用新轮次。正常 Leader 故障且仍有多数派时，其余副本接续已提交任务。没有多数派不能提交终态，也不能续发执行许可。
 
-主要参数：`robot_id`、`data_root`、`election_timeout`、`heartbeat_period`、`quorum_timeout`。持久化目录不得在活动任务中删除。调度方经 `/swarm/consensus/propose` 提案，只按 `/swarm/consensus/state` 中的已提交记录执行业务。
+主要参数为 `robot_id`、`data_root`、`election_timeout`、`heartbeat_period`、`quorum_timeout`。调度方经 `/swarm/consensus/propose` 提案，从 `/swarm/consensus/state` 获取任期、权限和提交水位，再经 `/swarm/consensus/fetch` 与 `/swarm/consensus/entries` 增量应用本机已提交记录。
 
-这是独立开发实现，未经形式化验证。当前快照仍保存全量已提交历史，长时增长及 8 MiB 消息上限需要进一步工程化。完整用法见 [协调器 README](../swarm_mission_coordinator/README.md)，故障验证见 [TEST_LOG](TEST_LOG.md)。
+落后设备按批次追赶。快照保留本轮已提交历史，磁盘增长待进行长时间实机验证。 [协调器 README](../swarm_mission_coordinator/README.md) · [TEST_LOG](TEST_LOG.md)
